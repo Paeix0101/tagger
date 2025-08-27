@@ -1,123 +1,204 @@
 import os
-import json
+import re
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
+from yt_dlp import YoutubeDL
 
-# =================== CONFIG =================== #
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-service.onrender.com
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 
-# =================== HELPERS =================== #
+# --------------------- helpers --------------------- #
+YDL_OPTS_COMMON = {
+    "quiet": True,
+    "nocheckcertificate": True,
+    "noplaylist": True,
+    "skip_download": True,
+    # Progressive MP4 (video+audio) to avoid ffmpeg merge
+    "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best",
+    "extract_flat": False,
+}
+
+INSTAGRAM_PAT = re.compile(r"(https?://)?(www\.)?instagram\.com/(p|reel|tv)/[A-Za-z0-9_\-]+")
+YOUTUBE_PAT = re.compile(r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[A-Za-z0-9_\-]+")
+
 def send_message(chat_id, text, parse_mode=None):
     data = {"chat_id": chat_id, "text": text}
     if parse_mode:
         data["parse_mode"] = parse_mode
         data["disable_web_page_preview"] = True
-    requests.post(f"{BOT_API}/sendMessage", json=data)
+    requests.post(f"{BOT_API}/sendMessage", json=data, timeout=20)
 
-def get_chat_administrators(chat_id):
-    resp = requests.get(f"{BOT_API}/getChatAdministrators?chat_id={chat_id}")
-    if resp.ok:
-        return resp.json().get("result", [])
-    return []
+def send_video(chat_id, video_url, caption=None):
+    data = {"chat_id": chat_id, "video": video_url}
+    if caption:
+        data["caption"] = caption[:1024]
+    requests.post(f"{BOT_API}/sendVideo", json=data, timeout=60)
 
-def save_member(chat_id, user_id, first_name, username=None):
-    """Save members per group for tagging later"""
-    filename = f"members_{chat_id}.txt"
-    if not os.path.exists(filename):
-        open(filename, "w").close()
-    with open(filename, "r") as f:
-        members = f.read().splitlines()
-    if str(user_id) not in [m.split("|")[0] for m in members]:
-        with open(filename, "a") as f:
-            f.write(f"{user_id}|{first_name}|{username or ''}\n")
+def send_photo(chat_id, photo_url, caption=None):
+    data = {"chat_id": chat_id, "photo": photo_url}
+    if caption:
+        data["caption"] = caption[:1024]
+    requests.post(f"{BOT_API}/sendPhoto", json=data, timeout=60)
 
-def load_members(chat_id):
-    filename = f"members_{chat_id}.txt"
-    if not os.path.exists(filename):
-        return []
-    with open(filename, "r") as f:
-        members = [line.strip().split("|") for line in f.readlines()]
-    return members  # list of [id, first_name, username]
+def extract_medias(url: str):
+    """
+    Returns a list of dicts: [{"type": "video"|"photo", "url": "...", "caption": "..."}]
+    Uses yt-dlp to get direct media URLs so Telegram can fetch them.
+    """
+    medias = []
+    with YoutubeDL(YDL_OPTS_COMMON) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-def split_mentions(mentions, max_len=4000):
-    """Split mention text into chunks within Telegram’s limit"""
-    chunks, current = [], ""
-    for mention in mentions:
-        if len(current) + len(mention) + 1 > max_len:
-            chunks.append(current)
-            current = mention
-        else:
-            current += " " + mention if current else mention
-    if current:
-        chunks.append(current)
-    return chunks
+    # If playlist/album of multiple entries (IG carousel etc.)
+    if isinstance(info, dict) and info.get("_type") == "playlist" and "entries" in info:
+        entries = info["entries"] or []
+    else:
+        entries = [info]
 
-# =================== WEBHOOK =================== #
-@app.route("/", methods=["POST", "GET"])
+    for it in entries:
+        if not isinstance(it, dict):
+            continue
+
+        # Try to choose a direct URL
+        direct_url = it.get("url")
+        ext = (it.get("ext") or "").lower()
+        vcodec = it.get("vcodec")
+        acodec = it.get("acodec")
+        thumbnails = it.get("thumbnails") or []
+        title = it.get("title") or ""
+        desc = it.get("description") or ""
+        caption = title if title else (desc[:200] if desc else "")
+
+        # Heuristic: video if we have both codecs or ext is mp4/webm
+        is_video = (vcodec and vcodec != "none") or ext in {"mp4", "webm", "m4v"}
+
+        if direct_url and is_video:
+            medias.append({"type": "video", "url": direct_url, "caption": caption})
+            continue
+
+        # If not video, try to pick a high-res thumbnail/photo
+        photo_url = None
+        if thumbnails:
+            # pick the largest thumbnail by width/height if present
+            sorted_thumbs = sorted(
+                thumbnails,
+                key=lambda t: (t.get("height") or 0) * (t.get("width") or 0),
+                reverse=True,
+            )
+            if sorted_thumbs and sorted_thumbs[0].get("url"):
+                photo_url = sorted_thumbs[0]["url"]
+
+        # Instagram images often provide direct 'url' with ext=jpg
+        if not photo_url and direct_url and (ext in {"jpg", "jpeg", "png"}):
+            photo_url = direct_url
+
+        if photo_url:
+            medias.append({"type": "photo", "url": photo_url, "caption": caption})
+
+    return medias
+
+def is_instagram(url: str) -> bool:
+    return bool(INSTAGRAM_PAT.search(url))
+
+def is_youtube(url: str) -> bool:
+    return bool(YOUTUBE_PAT.search(url))
+
+def find_url_in_text(text: str) -> str | None:
+    if not text:
+        return None
+    # quick url pick (first http(s)://... )
+    m = re.search(r"https?://[^\s]+", text)
+    return m.group(0) if m else None
+
+# --------------------- webhook --------------------- #
+@app.route("/", methods=["GET"])
+def home():
+    return "IG/YT fetch bot running ✅"
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == "GET":
-        return "Bot is running ✅"
-
-    update = request.get_json()
+    update = request.get_json(force=True, silent=True) or {}
     msg = update.get("message") or update.get("channel_post")
-    my_chat_member = update.get("my_chat_member")
+    if not msg:
+        return jsonify(ok=True)
 
-    # Track members when they talk
-    if msg:
-        chat_id = msg["chat"]["id"]
-        from_user = msg.get("from", {})
-        if str(chat_id).startswith("-") and from_user.get("id"):
-            save_member(chat_id, from_user["id"], from_user.get("first_name", "User"), from_user.get("username"))
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    is_private = chat.get("type") == "private"
+    text = msg.get("text") or msg.get("caption") or ""
 
-    # =================== /runtag =================== #
-    if msg and "reply_to_message" in msg and msg.get("text", "").lower().startswith("/runtag"):
-        chat_id = msg["chat"]["id"]
-        from_user = msg.get("from", {})
+    # Only serve in DM; if used in group, ask user to DM the bot
+    if not is_private:
+        # try to DM the sender if they have /start-ed the bot
+        user = msg.get("from") or {}
+        uid = user.get("id")
+        if uid:
+            send_message(uid, "👋 Link mujhe **DM** me bhejo. Main yahin aapko media bhej dunga.")
+        return jsonify(ok=True)
 
-        # Check admin
-        admins = [a["user"]["id"] for a in get_chat_administrators(chat_id)]
-        is_admin = from_user["id"] in admins if from_user else False
+    if text.strip().lower().startswith("/start"):
+        send_message(
+            chat_id,
+            "Send me an Instagram **post/reel** or YouTube **video** link.\n"
+            "I’ll try to send the video/image directly here. 🔗➡️🎥🖼️"
+        )
+        return jsonify(ok=True)
 
-        if not is_admin:
-            send_message(chat_id, "⚠️ Only admins can use /runtag")
-            return "OK"
+    url = find_url_in_text(text)
+    if not url:
+        send_message(chat_id, "Please send an Instagram/YouTube link.")
+        return jsonify(ok=True)
 
-        replied_msg = msg["reply_to_message"]
+    if not (is_instagram(url) or is_youtube(url)):
+        send_message(chat_id, "I currently support Instagram posts/reels and YouTube videos only.")
+        return jsonify(ok=True)
 
-        # Load members
-        members = load_members(chat_id)
-        if not members:
-            send_message(chat_id, "❌ No members tracked yet. Bot only knows those who have spoken.")
-            return "OK"
+    try:
+        medias = extract_medias(url)
+        if not medias:
+            send_message(chat_id, "Sorry, couldn’t fetch media for that link.")
+            return jsonify(ok=True)
 
-        # Build mentions
-        mention_list = []
-        for uid, first, uname in members:
-            if uname:
-                mention_list.append(f"@{uname}")
-            else:
-                mention_list.append(f"<a href='tg://user?id={uid}'>{first}</a>")
+        # Send each media item; keep it simple
+        sent_any = False
+        for m in medias:
+            if m["type"] == "video":
+                send_video(chat_id, m["url"], caption=m.get("caption"))
+                sent_any = True
+            elif m["type"] == "photo":
+                send_photo(chat_id, m["url"], caption=m.get("caption"))
+                sent_any = True
 
-        # Copy the replied message
-        requests.post(f"{BOT_API}/copyMessage", json={
-            "chat_id": chat_id,
-            "from_chat_id": chat_id,
-            "message_id": replied_msg["message_id"]
-        })
+        if not sent_any:
+            send_message(chat_id, "I found something, but couldn’t send it. It may be restricted.")
+    except Exception as e:
+        # Most common causes: private/protected content, region locks, or site changes
+        send_message(
+            chat_id,
+            "Fetch failed. Possible reasons:\n"
+            "• Private/protected content\n"
+            "• Region-locked / age-restricted\n"
+            "• Site changed layout\n\n"
+            f"Error: {type(e).__name__}"
+        )
 
-        # Send mentions in chunks
-        chunks = split_mentions(mention_list)
-        for chunk in chunks:
-            send_message(chat_id, f"📢 {chunk}", parse_mode="HTML")
+    return jsonify(ok=True)
 
-        return "OK"
-
-    return "OK"
-
-# =================== RUN =================== #
+# --------------------- run locally / set webhook --------------------- #
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    # Optional: auto-set webhook if WEBHOOK_URL provided
+    if WEBHOOK_URL and BOT_TOKEN:
+        try:
+            requests.get(
+                f"{BOT_API}/setWebhook",
+                params={"url": f"{WEBHOOK_URL}/webhook"},
+                timeout=10
+            )
+        except Exception:
+            pass
+
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
