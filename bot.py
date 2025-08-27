@@ -4,13 +4,13 @@ import requests
 import yt_dlp
 from flask import Flask, request
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Render pe Environment Variable me set karna
+# ✅ Environment variable for Telegram bot
+BOT_TOKEN = os.getenv("BOT_TOKEN")  
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-FILE_URL = f"https://api.telegram.org/file/bot{BOT_TOKEN}/"
 
 app = Flask(__name__)
 
-# ✅ Home route (to check service is live)
+# ✅ Home route
 @app.route("/", methods=["GET"])
 def home():
     return "✅ Telegram Bot is running on Render!"
@@ -22,15 +22,14 @@ def webhook():
     if not update:
         return {"ok": False}
 
-    print("📩 Update received:", update)  # Debugging logs
+    print("📩 Update received:", update)
 
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
         text = update["message"].get("text", "")
 
-        # Reply to /start
         if text == "/start":
-            send_message(chat_id, "Hello 👋 I can download YouTube & Instagram videos. Just send me a link!")
+            send_message(chat_id, "👋 Hello! Send me a YouTube or Instagram link and I'll download it for you.")
         elif is_youtube_url(text) or is_instagram_url(text):
             send_message(chat_id, "⏳ Downloading your video, please wait...")
             download_and_send(chat_id, text)
@@ -39,39 +38,47 @@ def webhook():
 
     return {"ok": True}
 
-# ✅ Check if message is YouTube link
+# ✅ YouTube regex
 def is_youtube_url(url):
     youtube_regex = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+"
     return re.match(youtube_regex, url)
 
-# ✅ Check if message is Instagram link
+# ✅ Instagram regex
 def is_instagram_url(url):
     insta_regex = r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/.+"
     return re.match(insta_regex, url)
 
-# ✅ Download video using yt-dlp and send to Telegram
+# ✅ Download & send video
 def download_and_send(chat_id, url):
     try:
         ydl_opts = {
-            "format": "mp4",
-            "outtmpl": "/tmp/video.%(ext)s",  # save in temp folder
+            "format": "best",   # get best quality available
+            "outtmpl": "/tmp/video.%(ext)s",
+            "quiet": True,
+            "noplaylist": True,
         }
+
+        # ✅ Optional: use cookies.txt if available (for YouTube)
+        cookies_path = "/etc/cookies.txt"  # Upload this file in Render if needed
+        if os.path.exists(cookies_path):
+            ydl_opts["cookiefile"] = cookies_path
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info)
 
-        # ✅ Send as video file
+        # ✅ Send video
         send_video(chat_id, file_path)
 
-        # ✅ remove file after sending
+        # ✅ Clean up
         if os.path.exists(file_path):
             os.remove(file_path)
 
     except Exception as e:
         print("❌ Error downloading:", e)
-        send_message(chat_id, "❌ Failed to download video. Try another link.")
+        send_message(chat_id, "❌ Failed to download video. Try another link or check if it needs login.")
 
-# ✅ Helper function to send text messages
+# ✅ Send text message
 def send_message(chat_id, text):
     url = f"{BASE_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
@@ -80,7 +87,7 @@ def send_message(chat_id, text):
     except Exception as e:
         print("❌ Error sending message:", e)
 
-# ✅ Helper function to send video files
+# ✅ Send video file
 def send_video(chat_id, file_path):
     url = f"{BASE_URL}/sendVideo"
     try:
@@ -90,7 +97,6 @@ def send_video(chat_id, file_path):
             requests.post(url, data=data, files=files)
     except Exception as e:
         print("❌ Error sending video:", e)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
