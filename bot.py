@@ -1,25 +1,23 @@
 import os
 from flask import Flask, request
 from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler
-from telegram.error import Forbidden
+from telegram.ext import CommandHandler
 
-# Load BOT TOKEN
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 
-# Load allowed groups from groups.txt
+# Load allowed groups
 with open("groups.txt") as f:
     ALLOWED_GROUPS = [line.strip() for line in f if line.strip()]
 
 app = Flask(__name__)
 
 # Command: /runtag
-def runtag(update: Update, context):
+def runtag(update: Update):
     chat = update.effective_chat
     user = update.effective_user
 
-    # Check if group is allowed
+    # Only allow groups from groups.txt
     if str(chat.id) not in ALLOWED_GROUPS:
         return
 
@@ -36,12 +34,12 @@ def runtag(update: Update, context):
 
     replied = update.message.reply_to_message
 
-    # Try fetching members (works if group < 200, Telegram API restriction)
+    # Try fetching members (Telegram limitation: works for admins or <200 members)
     try:
         members = bot.get_chat_administrators(chat.id)
         tags = " ".join([m.user.mention_html() for m in members])
-    except Forbidden:
-        update.message.reply_text("⚠️ Cannot fetch all members in large groups.")
+    except Exception as e:
+        update.message.reply_text(f"⚠️ Cannot fetch all members. {e}")
         return
 
     # Send tagging message
@@ -51,13 +49,12 @@ def runtag(update: Update, context):
         parse_mode="HTML"
     )
 
-# Flask route for webhook
+# Flask webhook route
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
-    dp = Dispatcher(bot, None, workers=0)
-    dp.add_handler(CommandHandler("runtag", runtag))
-    dp.process_update(update)
+    if update.message and update.message.text and update.message.text.startswith("/runtag"):
+        runtag(update)
     return "ok"
 
 @app.route("/")
